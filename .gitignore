@@ -1,0 +1,51 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Packaging / virtualenvs
+.eggs/
+*.egg-info/
+build/
+dist/
+*.whl
+.venv/
+venv/
+env/
+
+# Native extension / build artifacts
+*.so
+*.so.*
+*.dylib
+*.dll
+*.pyd
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.pdb
+*.dSYM/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+build*.log
+
+# Local editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
