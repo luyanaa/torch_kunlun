@@ -43,6 +43,21 @@ This is the first slice: device/allocator/guard plus a few FP16/FP32 ops. It is
 - The build was made before the final `native_batch_norm` registry-return fix. Re-run the same build on the K200 host before importing.
 - Importing the produced extension on a host **without** the K200 driver wedged the machine; do not use a CPU-only host for runtime import.
 
+## Safety / fallback policy
+
+- `copy_` currently requires equal shapes and matching dtype. Broadcasting and
+  dtype conversion are intentionally rejected rather than reading past the
+  source allocation.
+- CPU↔device `copy_` synchronizes even when `non_blocking=True`, because XPURT
+  has no stream-aware memcpy and the source CPU buffer may be released.
+- `KUNLUN_CPU_FALLBACK` controls explicit/generic CPU fallbacks:
+  `error` rejects them, `warn` (default) prints and counts, `silent` suppresses
+  the message.
+- XCCL Work uses a conservative completed model: ProcessGroup calls synchronize
+  before reporting completion; `is_completed()` never returns true early.
+- `getDeviceFromPtr` resolves pointers through the allocator; unknown pointers
+  are rejected instead of being attributed to the current device.
+
 ## Allocation guard
 
 K200 `xpu_malloc` can hang instead of returning OOM for oversized requests.

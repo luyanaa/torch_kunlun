@@ -106,6 +106,15 @@ Non-differentiable forward:
 - `einsum` currently CPU host-staged, not XDNN native
 - `Adam`/`AdamW` are implemented; missing remaining optimizer in-place ops are still TODO
 
+## 2026-10-28 safety review fixes
+
+- `copy_`: equal-shape guard; host copies synchronize even with non_blocking.
+- `addbmm` is now separate from `baddbmm` (batch sum vs batch output).
+- XCCL `Work`: conservative synchronous completion; no early `is_completed`.
+- `create_stream` selects the requested device; `getDeviceFromPtr` uses
+  allocator ownership; global stream pool is per-device.
+- `KUNLUN_CPU_FALLBACK=error|warn|silent` for explicit and generic fallbacks.
+
 ## Rule
 
 Do not rely on the generic `cpu_fallback` for training paths.  It can silently

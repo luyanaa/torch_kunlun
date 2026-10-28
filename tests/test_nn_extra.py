@@ -241,3 +241,22 @@ def test_conv3d_conv_transpose2d_autograd():
     assert torch.allclose(xk.grad.cpu(), xr.grad, atol=5e-2, rtol=5e-2)
     assert torch.allclose(wk.grad.cpu(), wr.grad, atol=5e-2, rtol=5e-2)
     assert torch.allclose(bk.grad.cpu(), br.grad, atol=5e-2, rtol=5e-2)
+
+
+def test_addbmm_semantics_and_grad():
+    a = torch.randn(3, 2, 5, dtype=torch.float16)
+    b = torch.randn(3, 5, 4, dtype=torch.float16)
+    c = torch.randn(2, 4, dtype=torch.float16)
+    ar, br, cr = a.clone().requires_grad_(), b.clone().requires_grad_(), c.clone().requires_grad_()
+    out_r = torch.addbmm(cr, ar, br, beta=0.0, alpha=0.7)
+    out_r.backward(_ones(out_r))
+    ak = a.to("kunlun").requires_grad_()
+    bk = b.to("kunlun").requires_grad_()
+    ck = c.to("kunlun").requires_grad_()
+    out_k = torch.addbmm(ck, ak, bk, beta=0.0, alpha=0.7)
+    out_k.backward(_ones(out_k))
+    kunlun.synchronize()
+    assert out_k.shape == (2, 4)
+    assert torch.allclose(out_k.cpu(), out_r.detach(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(ak.grad.cpu(), ar.grad, atol=5e-2, rtol=5e-2)
+    assert torch.allclose(bk.grad.cpu(), br.grad, atol=5e-2, rtol=5e-2)

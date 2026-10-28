@@ -92,6 +92,52 @@ at::Tensor baddbmm_forward(const at::Tensor& self, const at::Tensor& batch1,
     return out;
 }
 
+
+class AddbmmFunction : public Function<AddbmmFunction> {
+public:
+    static at::Tensor forward(AutogradContext* ctx, at::Tensor self, at::Tensor batch1,
+                              at::Tensor batch2, at::Scalar beta, at::Scalar alpha) {
+        at::AutoDispatchBelowAutograd guard;
+        auto mm = at::sum(bmm_contig(batch1, batch2), {0}, false);
+        auto out = scale_tensor(mm, alpha.toDouble());
+        if (beta.toDouble() != 0.0) out = at::add(scale_tensor(self, beta.toDouble()), out);
+        ctx->save_for_backward({self, batch1, batch2});
+        ctx->saved_data["beta"] = beta.toDouble();
+        ctx->saved_data["alpha"] = alpha.toDouble();
+        return out;
+    }
+    static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
+        auto saved = ctx->get_saved_variables();
+        auto self = saved[0]; auto b1 = saved[1]; auto b2 = saved[2];
+        auto grad = grad_outputs[0].contiguous();
+        const double alpha = ctx->saved_data["alpha"].toDouble();
+        const double beta = ctx->saved_data["beta"].toDouble();
+        const int64_t batch = b1.size(0);
+        auto g = grad.unsqueeze(0).expand({batch, grad.size(0), grad.size(1)}).contiguous();
+        g = scale_tensor(g, alpha);
+        auto g1 = bmm_contig(g, b2.transpose(1, 2));
+        auto g2 = bmm_contig(b1.transpose(1, 2), g);
+        auto gs = beta == 0.0 ? at::Tensor() : scale_tensor(grad, beta);
+        return {gs, g1, g2, at::Tensor(), at::Tensor()};
+    }
+};
+
+at::Tensor addbmm_autograd(const at::Tensor& self, const at::Tensor& batch1,
+                           const at::Tensor& batch2, const at::Scalar& beta,
+                           const at::Scalar& alpha) {
+    return AddbmmFunction::apply(self, batch1, batch2, beta, alpha);
+}
+
+at::Tensor addbmm_forward(const at::Tensor& self, const at::Tensor& batch1,
+                          const at::Tensor& batch2, const at::Scalar& beta,
+                          const at::Scalar& alpha) {
+    at::AutoDispatchBelowAutograd guard;
+    auto mm = at::sum(bmm_contig(batch1, batch2), {0}, false);
+    auto out = scale_tensor(mm, alpha.toDouble());
+    if (beta.toDouble() != 0.0) out = at::add(scale_tensor(self, beta.toDouble()), out);
+    return out;
+}
+
 class MatmulFunction : public Function<MatmulFunction> {
 public:
     static at::Tensor forward(AutogradContext* ctx, at::Tensor self, at::Tensor other) {
@@ -99,6 +145,7 @@ public:
                             (self.dim() == 3 && other.dim() == 3) ||
                             (self.dim() == 4 && other.dim() == 4);
         if (!native) {
+            note_cpu_fallback("matmul");
             auto cpu_a = to_cpu(self);
             auto cpu_b = to_cpu(other);
             auto cpu_out = at::matmul(cpu_a, cpu_b);
@@ -183,6 +230,7 @@ at::Tensor matmul_forward(const at::Tensor& self, const at::Tensor& other) {
                         (self.dim() == 3 && other.dim() == 3) ||
                         (self.dim() == 4 && other.dim() == 4);
     if (!native) {
+        note_cpu_fallback("matmul");
         auto cpu_out = at::matmul(to_cpu(self), to_cpu(other));
         return to_dev(cpu_out, self);
     }
@@ -208,12 +256,12 @@ at::Tensor matmul_forward(const at::Tensor& self, const at::Tensor& other) {
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("baddbmm", TORCH_FN(torch_kunlun::baddbmm_forward));
-    m.impl("addbmm", TORCH_FN(torch_kunlun::baddbmm_forward));
+    m.impl("addbmm", TORCH_FN(torch_kunlun::addbmm_forward));
     m.impl("matmul", TORCH_FN(torch_kunlun::matmul_forward));
 }
 
 TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
     m.impl("baddbmm", TORCH_FN(torch_kunlun::baddbmm_autograd));
-    m.impl("addbmm", TORCH_FN(torch_kunlun::baddbmm_autograd));
+    m.impl("addbmm", TORCH_FN(torch_kunlun::addbmm_autograd));
     m.impl("matmul", TORCH_FN(torch_kunlun::matmul_autograd));
 }

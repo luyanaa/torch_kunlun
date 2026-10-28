@@ -9,6 +9,8 @@
 #include "xpu/refactor/math.h"
 #include "xpu/refactor/nn.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <vector>
@@ -228,6 +230,10 @@ at::Tensor materialize_private_contiguous(const at::Tensor& src) {
 at::Tensor& copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     check_same_dtype(self, src, "copy_");
     check_contiguous(self, "copy_ destination");
+    // Safe subset until broadcast/dtype conversion is implemented: never read
+    // more bytes from src than its allocation owns.
+    TORCH_CHECK(self.sizes().equals(src.sizes()),
+                "kunlun copy_ requires equal shapes; broadcast copy is not implemented");
     at::Tensor source;
     if (src.is_contiguous()) {
         source = src;
@@ -290,7 +296,12 @@ at::Tensor& copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
         TORCH_CHECK(false, "kunlun copy_ unsupported device combination");
     }
 
-    if (!non_blocking) {
+    // Host-staged copies must not outlive the caller's CPU buffer.  XPURT has
+    // no stream-aware memcpy, so treat CPU<->device copies as synchronous even
+    // when PyTorch requests non_blocking=True.
+    const bool host_copy = self_type == c10::DeviceType::CPU ||
+                           src_type == c10::DeviceType::CPU;
+    if (!non_blocking || host_copy) {
         synchronize();
     }
     return self;
@@ -447,7 +458,24 @@ at::Tensor conv2d(const at::Tensor& input, const at::Tensor& weight,
     return {};
 }
 
+std::atomic<size_t>& cpu_fallback_count() {
+    static std::atomic<size_t> count{0};
+    return count;
+}
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+    const char* mode = std::getenv("KUNLUN_CPU_FALLBACK");
+    const std::string policy = mode == nullptr ? "warn" : mode;
+    const std::string name = op.schema().name();
+    if (policy == "error") {
+        TORCH_CHECK(false, "kunlun CPU fallback disabled (KUNLUN_CPU_FALLBACK=error): ", name);
+    }
+    const size_t count = ++cpu_fallback_count();
+    if (policy != "silent") {
+        std::fprintf(stderr,
+                     "kunlun CPU fallback #%zu: %s (set KUNLUN_CPU_FALLBACK=error to reject)\n",
+                     count, name.c_str());
+    }
     at::native::cpu_fallback(op, stack);
 }
 

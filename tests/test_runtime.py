@@ -75,3 +75,10 @@ def test_empty_strided():
     x.zero_()
     kunlun.synchronize()
     assert torch.all(x.cpu() == 0)
+
+
+def test_copy_shape_mismatch_is_rejected():
+    dst = torch.empty(1024, dtype=torch.float16, device="kunlun")
+    src = torch.ones(1, dtype=torch.float16, device="kunlun")
+    with pytest.raises(RuntimeError, match="equal shapes"):
+        dst.copy_(src)

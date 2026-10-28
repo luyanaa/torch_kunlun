@@ -128,6 +128,7 @@ public:
         // If the native reduction ABI is unavailable, leave the stage to the
         // established CPU-staged loss path.  This class is intentionally only
         // installed where the native call can be verified later on K200.
+        note_cpu_fallback("loss");
         auto cpu_self = to_cpu(self);
         auto cpu_target = to_cpu(target);
         auto cpu_weight = to_cpu(weight.value_or(at::Tensor()));

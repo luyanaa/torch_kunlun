@@ -31,6 +31,7 @@ class EinsumFunction : public Function<EinsumFunction> {
 public:
     static at::Tensor forward(AutogradContext* ctx, std::string equation,
                               std::vector<at::Tensor> tensors) {
+        note_cpu_fallback("einsum");
         std::vector<at::Tensor> cpu_tensors;
         cpu_tensors.reserve(tensors.size());
         for (const auto& t : tensors) cpu_tensors.push_back(to_cpu(t));

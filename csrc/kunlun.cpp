@@ -11,6 +11,10 @@
 #include "xpu/refactor/context/newcontext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -40,6 +44,21 @@ void set_device(int device) {
 
 void synchronize() {
     synchronize_all();
+}
+
+void note_cpu_fallback(const char* op) {
+    static std::atomic<size_t> count{0};
+    const char* mode = std::getenv("KUNLUN_CPU_FALLBACK");
+    const std::string policy = mode == nullptr ? "warn" : mode;
+    if (policy == "error") {
+        TORCH_CHECK(false, "kunlun CPU fallback disabled (KUNLUN_CPU_FALLBACK=error): ", op);
+    }
+    const size_t n = ++count;
+    if (policy != "silent") {
+        std::fprintf(stderr,
+                     "kunlun CPU fallback #%zu: %s (set KUNLUN_CPU_FALLBACK=error to reject)\n",
+                     n, op);
+    }
 }
 
 namespace {
@@ -111,8 +130,12 @@ uint64_t default_stream_id(int device) {
 }
 
 uint64_t create_stream(int device) {
+    int old_device = 0;
+    check_xpu(xpu_current_device(&old_device), "xpu_current_device");
+    check_xpu(xpu_set_device(device), "xpu_set_device(create_stream)");
     XPUStream stream = nullptr;
     check_xpu(xpu_stream_create(&stream), "xpu_stream_create");
+    check_xpu(xpu_set_device(old_device), "xpu_set_device(create_stream restore)");
     auto* handle = new StreamHandle{stream, device, true};
     {
         std::lock_guard<std::mutex> lock(stream_mu());
@@ -212,6 +235,7 @@ void event_synchronize(uint64_t event_id) {
 }
 
 bool event_query(uint64_t event_id) {
+    // XPURT has no non-blocking event query; this is intentionally a wait.
     auto* event = event_from_id(event_id);
     if (event == nullptr || event->event == nullptr) {
         return true;
@@ -297,7 +321,30 @@ struct KunlunGuardImpl final : c10::impl::DeviceGuardImplInterface {
     }
 
     c10::Stream getStreamFromGlobalPool(c10::Device d, bool = false) const override {
-        return getStream(d);
+        // A minimal per-device global pool: create once and reuse.  XPURT
+        // streams are not reference-counted, so never destroy a pooled handle.
+        static std::mutex pool_mu;
+        static std::map<int, uint64_t> pool;
+        uint64_t id = 0;
+        {
+            std::lock_guard<std::mutex> lock(pool_mu);
+            auto it = pool.find(d.index());
+            if (it != pool.end()) id = it->second;
+        }
+        if (id == 0) {
+            const uint64_t created = create_stream(d.index());
+            std::lock_guard<std::mutex> lock(pool_mu);
+            auto [it, inserted] = pool.emplace(d.index(), created);
+            if (!inserted) {
+                // Another thread won the race; discard the extra handle.
+                destroy_stream(created);
+                id = it->second;
+            } else {
+                id = created;
+            }
+        }
+        return c10::Stream(c10::Stream::UNSAFE, d,
+                           static_cast<c10::StreamId>(id));
     }
 
     c10::Stream getNewStream(c10::Device d, int = 0) const override {
@@ -366,8 +413,10 @@ struct KunlunHooksInterface final : at::PrivateUse1HooksInterface {
 
     void init() const override {}
 
-    at::Device getDeviceFromPtr(void*) const override {
-        return at::Device(at::DeviceType::PrivateUse1, current_device());
+    at::Device getDeviceFromPtr(void* ptr) const override {
+        const int device = torch_kunlun::device_of_ptr(ptr);
+        TORCH_CHECK(device >= 0, "kunlun getDeviceFromPtr: pointer is not owned by torch_kunlun allocator");
+        return at::Device(at::DeviceType::PrivateUse1, device);
     }
 
     bool isPinnedPtr(const void*) const override {

@@ -37,6 +37,7 @@ void event_record(uint64_t event_id, uint64_t stream_id);
 void stream_wait_event(uint64_t stream_id, uint64_t event_id);
 void event_synchronize(uint64_t event_id);
 bool event_query(uint64_t event_id);
+void note_cpu_fallback(const char* op);
 void record_data_ptr_on_stream(const c10::DataPtr& data_ptr, const c10::Stream& stream);
 
 // BKCL/XCCL collective wrappers (one context per process).
@@ -57,6 +58,7 @@ void adamw_step(const at::Tensor& param, const at::Tensor& grad, at::Tensor& mom
 
 size_t memory_allocated();
 size_t memory_reserved();
+int device_of_ptr(void* ptr);
 void empty_cache();
 c10::Allocator* get_allocator();
 

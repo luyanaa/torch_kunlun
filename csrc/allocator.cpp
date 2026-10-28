@@ -87,6 +87,7 @@ public:
                 // than returning memory with an unknown lifetime.
                 xpu_set_device(device);
                 xpu_free(block.ptr);
+                block_device_.erase(block.ptr);
                 auto& budget = budget_for_locked(device);
                 if (budget.reserved >= block.size) budget.reserved -= block.size;
                 if (reserved_ >= block.size) reserved_ -= block.size;
@@ -110,6 +111,7 @@ public:
                 reserved_ += n;
             }
             live_[ptr] = LiveBlock{device, n, {}};
+            block_device_[ptr] = device;
             allocated_ += n;
         }
         return c10::DataPtr(ptr, ptr, &KunlunCachingAllocator::deleter, c10_device);
@@ -198,6 +200,7 @@ public:
                 for (auto& block : entry.second) {
                     blocks.push_back(std::move(block));
                     devices.push_back(entry.first.first);
+                    block_device_.erase(block.ptr);
                 }
             }
             free_.clear();
@@ -224,6 +227,12 @@ public:
     size_t reserved() const {
         std::lock_guard<std::mutex> lock(mu_);
         return reserved_;
+    }
+
+    int device_of_ptr(void* ptr) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = block_device_.find(ptr);
+        return it == block_device_.end() ? -1 : it->second;
     }
 
 private:
@@ -292,6 +301,7 @@ private:
     std::map<std::pair<int, size_t>, std::vector<FreeBlock>> free_;
     std::map<int, DeviceBudget> budgets_;
     std::unordered_map<void*, LiveBlock> live_;
+    std::unordered_map<void*, int> block_device_;
     size_t allocated_ = 0;
     size_t reserved_ = 0;
 };
@@ -308,6 +318,10 @@ size_t memory_allocated() {
 
 size_t memory_reserved() {
     return KunlunCachingAllocator::instance().reserved();
+}
+
+int device_of_ptr(void* ptr) {
+    return KunlunCachingAllocator::instance().device_of_ptr(ptr);
 }
 
 void empty_cache() {

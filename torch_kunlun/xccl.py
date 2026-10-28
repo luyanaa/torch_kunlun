@@ -86,18 +86,29 @@ def _op_name(op) -> str:
 
 
 class _XCCLWork(dist.Work):
-    """Completed work handle; XPURT has no non-blocking work query."""
+    """Work handle with a conservative completion model.
+
+    XPURT has no non-blocking event query.  The ProcessGroup therefore
+    synchronizes before returning a Work; is_completed() only becomes true
+    after that synchronization (or an explicit wait()).
+    """
+
+    def __init__(self, completed: bool = False):
+        super().__init__()
+        self._completed = bool(completed)
 
     def wait(self, timeout=None):
-        # BKCL is enqueued on the current XPU stream.  Waiting the device here
-        # makes the Python Work contract conservative and DDP-safe.
-        _C.synchronize()
+        if not self._completed:
+            _C.synchronize()
+            self._completed = True
         return True
 
     def is_completed(self) -> bool:
-        return True
+        return self._completed
 
     def get_future(self):
+        # Do not claim completion before the device work is done.
+        self.wait()
         fut = torch.futures.Future()
         fut.set_result(None)
         return fut
@@ -150,7 +161,8 @@ class ProcessGroupXCCL(dist.ProcessGroup):
         root = int(getattr(opts, "rootRank", 0) if opts is not None else 0)
         for tensor in tensors:
             _C.xccl_broadcast(tensor, root, _device_of(tensor))
-        return _XCCLWork()
+        _C.synchronize()
+        return _XCCLWork(True)
 
     def allreduce(self, tensors, opts=None):
         if isinstance(tensors, torch.Tensor):
@@ -158,14 +170,16 @@ class ProcessGroupXCCL(dist.ProcessGroup):
         op = _op_name(getattr(opts, "reduceOp", dist.ReduceOp.SUM))
         for tensor in tensors:
             _C.xccl_all_reduce(tensor, op, _device_of(tensor))
-        return _XCCLWork()
+        _C.synchronize()
+        return _XCCLWork(True)
 
     def allreduce_coalesced(self, tensors, opts=None):
         return self.allreduce(tensors, opts)
 
     def _allgather_base(self, output_buffer, input_buffer, opts=None):
         _C.xccl_all_gather(output_buffer, input_buffer, _device_of(input_buffer))
-        return _XCCLWork()
+        _C.synchronize()
+        return _XCCLWork(True)
 
     def all_gather(self, output_tensors, input_tensors, opts=None):
         # Non-coalesced fallback: one contiguous BKCL all-gather per input,
@@ -178,6 +192,7 @@ class ProcessGroupXCCL(dist.ProcessGroup):
                 inp.numel() * world, dtype=inp.dtype, device=inp.device
             )
             _C.xccl_all_gather(flat, inp, _device_of(inp))
+            _C.synchronize()
             for r, out in enumerate(out_list):
                 out.copy_(flat.narrow(0, r * inp.numel(), inp.numel()).view_as(out))
         return _XCCLWork()
@@ -185,11 +200,13 @@ class ProcessGroupXCCL(dist.ProcessGroup):
     def reduce_scatter(self, output, input, opts=None):
         op = _op_name(getattr(opts, "reduceOp", dist.ReduceOp.SUM))
         _C.xccl_reduce_scatter(output, input, op, _device_of(output))
-        return _XCCLWork()
+        _C.synchronize()
+        return _XCCLWork(True)
 
     def barrier(self, opts=None):
         _C.xccl_barrier(self._device())
-        return _XCCLWork()
+        _C.synchronize()
+        return _XCCLWork(True)
 
     def shutdown(self):
         destroy()

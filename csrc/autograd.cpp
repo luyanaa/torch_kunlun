@@ -1271,6 +1271,7 @@ public:
         TORCH_CHECK(self.device().type() == at::DeviceType::PrivateUse1,
                     "cross_entropy_loss requires a kunlun tensor");
         TORCH_CHECK(self.dim() == 2, "kunlun cross_entropy_loss supports 2-D logits");
+        note_cpu_fallback("cross_entropy_loss");
         auto cpu_self = at::empty(self.sizes(), self.options().device(at::kCPU));
         auto cpu_target = at::empty(target.sizes(), target.options().device(at::kCPU));
         cpu_self.copy_(self);
