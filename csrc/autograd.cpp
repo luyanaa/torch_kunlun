@@ -21,17 +21,6 @@ using torch::autograd::AutogradContext;
 using torch::autograd::Function;
 using torch::autograd::variable_list;
 
-struct ContextGuard {
-    DeviceContext& dc;
-    std::unique_lock<std::mutex> lock;
-
-    explicit ContextGuard(int device)
-        : dc(get_context(device)), lock(dc.mu) {
-        xpu_set_device(dc.device);
-        dc.ctx->set_stream(current_stream_native(dc.device));
-    }
-};
-
 void check_tensor(const at::Tensor& t, const char* what) {
     TORCH_CHECK(t.device().type() == at::DeviceType::PrivateUse1,
                 what, " requires a kunlun tensor");
@@ -250,7 +239,7 @@ public:
         const at::Tensor& self = saved[0];
         const at::Tensor& other = saved[1];
         const at::Tensor& out = saved[2];
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         if (self.sizes().equals(other.sizes())) {
             return {grad, grad, at::Tensor()};
         }
@@ -288,7 +277,7 @@ public:
     }
 
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         if (ctx->saved_data["dtype_half"].toBool()) {
             return {grad, scale_impl<float16>(grad, -1.0, 0.0), at::Tensor()};
         }
@@ -307,7 +296,7 @@ public:
 
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
         auto saved = ctx->get_saved_variables();
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         if (saved[0].scalar_type() == at::kHalf) {
             return {mul_impl<float16>(grad, saved[1]), mul_impl<float16>(grad, saved[0]),
                     at::Tensor()};
@@ -328,7 +317,7 @@ public:
 
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
         auto saved = ctx->get_saved_variables();
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         auto dx = at::empty_like(saved[0]);
         ContextGuard guard(saved[0].device().index());
         if (saved[0].scalar_type() == at::kHalf) {
@@ -359,7 +348,7 @@ public:
         auto saved = ctx->get_saved_variables();
         const at::Tensor& a = saved[0];
         const at::Tensor& b = saved[1];
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         const int64_t m = a.size(0), k = a.size(1), n = b.size(1);
         auto ga = at::empty({m, k}, a.options());
         auto gb = at::empty({k, n}, b.options());
@@ -403,7 +392,7 @@ public:
         const at::Tensor& input = saved[0];
         const at::Tensor& weight = saved[1];
         const at::Tensor& bias = saved[2];
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         const int64_t m = input.size(0), k = input.size(1), n = weight.size(0);
         auto gi = at::empty({m, k}, input.options());
         auto gw = at::empty({n, k}, weight.options());
@@ -464,7 +453,7 @@ public:
         const at::Tensor& self = saved[0];
         const at::Tensor& mat1 = saved[1];
         const at::Tensor& mat2 = saved[2];
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         const double beta = ctx->saved_data["beta"].toDouble();
         const double alpha = ctx->saved_data["alpha"].toDouble();
         const at::Tensor mat2c = mat2.is_contiguous() ? mat2 : mat2.contiguous();
@@ -539,7 +528,7 @@ public:
         auto saved = ctx->get_saved_variables();
         const at::Tensor& self = saved[0];
         const at::Tensor& target = saved[1];
-        at::Tensor grad = grad_outputs[0];
+        at::Tensor grad = grad_outputs[0].contiguous();
         const int64_t reduction = ctx->saved_data["reduction"].toInt();
         const double grad_value = grad.numel() == 1
             ? grad.detach().cpu().item<double>()
@@ -620,7 +609,7 @@ public:
         return out;
     }
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
-        auto grad = grad_outputs[0];
+        auto grad = grad_outputs[0].contiguous();
         const double factor = ctx->saved_data["factor"].toDouble();
         if (grad.scalar_type() == at::kHalf) {
             return {scale_impl<float16>(grad, factor, 0.0), at::Tensor()};

@@ -26,14 +26,14 @@ This is the first slice: device/allocator/guard plus a few FP16/FP32 ops. It is
 
 ## Not supported yet
 
-- pinned host memory, RNG
+- RNG
 - non-contiguous arithmetic inputs (`.contiguous()` now uses a host-staging fallback)
 - dropout training / RNG
 - other optimizers beyond Adam/AdamW
 - `torch.compile`
 - multi-node distributed; only the single-node `bkcl` ProcessGroup is provided
 - INT8 (generic path; attention INT8 is pending Gate 0-A)
-- >4 GB single allocation (device pointers are 32-bit)
+- single allocations ≥ 2 GiB (K200 device pointers and DMA lengths are 32-bit)
 
 ## Linux x86_64 build record
 
@@ -48,15 +48,30 @@ This is the first slice: device/allocator/guard plus a few FP16/FP32 ops. It is
 - `copy_` currently requires equal shapes and matching dtype. Broadcasting and
   dtype conversion are intentionally rejected rather than reading past the
   source allocation.
-- CPU↔device `copy_` synchronizes even when `non_blocking=True`, because XPURT
-  has no stream-aware memcpy and the source CPU buffer may be released.
-- `KUNLUN_CPU_FALLBACK` controls explicit/generic CPU fallbacks:
-  `error` rejects them, `warn` (default) prints and counts, `silent` suppresses
-  the message.
+- `xpu_memcpy` takes no stream and runs on XPURT's default stream, and
+  `xpu_wait(nullptr)` waits only that stream.  Every host↔device transfer
+  therefore drains the caller's stream, copies, then waits for the copy, so
+  `non_blocking=True` cannot defer anything.
+- Non-contiguous sources are materialized through host staging that copies only
+  the address range the view touches (not the whole storage).
+- `KUNLUN_CPU_FALLBACK` controls CPU execution:
+  - unset (default): the generic boxed fallback for ops without a device kernel
+    is **rejected**; operators with a deliberate host-staged implementation
+    (einsum, broadcast matmul, host-staged losses) run and print a one-time notice.
+  - `error`: rejects both.
+  - `warn`: allows both and prints every call.
+  - `silent`: allows both without messages.
 - XCCL Work uses a conservative completed model: ProcessGroup calls synchronize
   before reporting completion; `is_completed()` never returns true early.
-- `getDeviceFromPtr` resolves pointers through the allocator; unknown pointers
-  are rejected instead of being attributed to the current device.
+  `barrier()` drains the current stream before joining the host rendezvous, and
+  only float32/float16/int32 collectives are accepted.
+- `getDeviceFromPtr` resolves pointers through an address-interval index; unknown
+  pointers are rejected instead of being attributed to the current device.
+  Releasing an unknown pointer is reported and leaked, never passed to
+  `xpu_free`.
+- FP32 `mm`/`conv` are **not** IEEE FP32: XDNN runs int16 MAC with per-tensor
+  max dequantization for both FP16 and FP32, so only the FP16-scale error bound
+  holds.
 
 ## Allocation guard
 
@@ -69,12 +84,41 @@ before calling `xpu_malloc`:
 | `KUNLUN_MEMORY_FRACTION` | `0.85` | usable fraction of reported device capacity |
 | `KUNLUN_MEMORY_RESERVE_MB` | `256` | headroom reserved for XDNN/driver workspaces |
 | `KUNLUN_MEMORY_LIMIT_MB` | `0` | optional hard capacity override; `0` disables |
-| `KUNLUN_MAX_ALLOC_MB` | `1024` | max single allocation; `0` disables the check |
+| `KUNLUN_MAX_ALLOC_MB` | `2048` | max single allocation; capped at 2 GiB, `0` disables the check |
 
 Cached free blocks still count as reserved until `empty_cache()` actually
 frees them. `torch.kunlun.memory_reserved()` reports the reserved bytes.
-These checks reduce, but cannot eliminate, driver-side hangs caused by
-allocations made outside this allocator.
+The allocator rounds to 512 B, reuses free blocks best-fit, splits remainders
+≥ 1 MiB, coalesces address-adjacent blocks, and records an event on the
+allocating and freeing streams so a block is only reused after both are
+complete.  These checks reduce, but cannot eliminate, driver-side hangs caused
+by allocations made outside this allocator.
+
+## Pinned host memory
+
+`torch_kunlun` binds XPURT's page-locked host pool to the PrivateUse1 hooks,
+so `DataLoader(pin_memory=True)` and `tensor.pin_memory()` produce buffers that
+`xpu_memcpy` can DMA directly.  Use `torch.kunlun.is_pinned_tensor(t)` /
+`is_pinned_ptr(addr)` to test them; `torch.is_pinned` only knows CUDA's pool.
+
+## Scheduling and version checks
+
+| env | default | meaning |
+|---|---:|---|
+| `KUNLUN_NCLUSTER` | `4` | clusters per XDNN launch (1..4) |
+| `KUNLUN_NSDNN` | `4` | SDNN engines per XDNN launch (1..4) |
+| `KUNLUN_CLUSTER_POLICY` | `fixed` | `auto` drops launches below 4 Mi elements to 1 cluster |
+| `KUNLUN_XDNN_REQUIRE` | unset | fail import unless the loaded XDNN version contains this tag |
+| `KUNLUN_XDNN_ALLOW_MISMATCH` | unset | silence the "compiled against 2.0.x" warning |
+| `KUNLUN_SKIP_XDNN_VERSION_CHECK` | unset | skip the version check entirely |
+| `KUNLUN_XDNN_VERSION` | unset | override the detected version tag |
+
+The budget is applied per launch (`torch.kunlun.set_cluster_budget()` at
+runtime), which lets a Triton kernel started with `ncluster=2` share the PD.
+`auto` only reacts to ops that supply a work estimate (`fill_`, `add`, `relu`,
+`fc`, `conv2d`); everything else uses the fixed budget.  It is a cap, not a
+reservation: XDNN has no non-blocking completion query, so the next launch
+cannot know when the other engine's clusters are free.
 
 ## Host safety
 

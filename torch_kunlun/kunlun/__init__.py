@@ -68,6 +68,51 @@ def empty_cache() -> None:
     _C.empty_cache()
 
 
+def xdnn_version() -> str:
+    """Version tag of the libxpuapi loaded at runtime (may be empty)."""
+    return str(_C.xdnn_version())
+
+
+def cluster_budget() -> int:
+    return int(_C.cluster_budget())
+
+
+def sdnn_budget() -> int:
+    return int(_C.sdnn_budget())
+
+
+def set_cluster_budget(nclusters: int, nsdnn: Optional[int] = None) -> int:
+    """Cap the clusters/SDNN engines used by subsequent XDNN launches.
+
+    A K200 PD exposes 4 XPU clusters and 4 SDNN engines; every launch uses at
+    most ``nclusters`` of them.  Lower the budget when another engine (for
+    example a Triton kernel launched with ``ncluster=2``) must share the same
+    PD.  The budget is applied per launch, so it only affects work submitted
+    after the call.  ``KUNLUN_NCLUSTER`` / ``KUNLUN_NSDNN`` set the initial
+    value and ``KUNLUN_CLUSTER_POLICY=auto`` additionally drops small launches
+    to a single cluster.
+    """
+    nsdnn = nclusters if nsdnn is None else nsdnn
+    return int(_C.set_cluster_budget(int(nclusters), int(nsdnn)))
+
+
+def is_pinned_ptr(address: int) -> bool:
+    """True if ``address`` is a page-locked host buffer from xpu_host_alloc."""
+    return bool(_C.is_pinned_ptr(int(address)))
+
+
+def is_pinned_tensor(tensor: torch.Tensor) -> bool:
+    """True if ``tensor`` is a CPU tensor in XPURT page-locked memory.
+
+    This is what ``DataLoader(pin_memory=True)`` and non-blocking H2D copies
+    rely on; it is not the same as ``torch.is_pinned`` (which only knows about
+    CUDA's pinned allocator).
+    """
+    if tensor.device.type != "cpu":
+        return False
+    return is_pinned_ptr(tensor.data_ptr())
+
+
 def _is_in_bad_fork() -> bool:
     return False
 

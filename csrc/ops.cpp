@@ -9,27 +9,21 @@
 #include "xpu/refactor/math.h"
 #include "xpu/refactor/nn.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 namespace torch_kunlun {
 namespace {
 
 using baidu::xpu::api::Context;
-
-struct ContextGuard {
-    DeviceContext& dc;
-    std::unique_lock<std::mutex> lock;
-
-    explicit ContextGuard(int device)
-        : dc(get_context(device)), lock(dc.mu) {
-        xpu_set_device(dc.device);
-        dc.ctx->set_stream(current_stream_native(dc.device));
-    }
-};
 
 void check_same_dtype(const at::Tensor& a, const at::Tensor& b, const char* what) {
     TORCH_CHECK(a.scalar_type() == b.scalar_type(), what,
@@ -50,9 +44,69 @@ T* mptr(at::Tensor& t) {
     return reinterpret_cast<T*>(t.data_ptr());
 }
 
+// ---- device/host transfer helpers -----------------------------------------
+// xpu_memcpy has no stream argument: it executes on XPURT's default stream.
+// Every transfer therefore drains the caller's stream first (so the copy sees
+// earlier launches) and waits for the copy before returning (so later launches
+// on the caller's stream see the result).
+
+void drain_stream(int device) {
+    xpu_set_device(device);
+    check_xpu(xpu_wait(current_stream_native(device)), "xpu_wait(stream drain)");
+}
+
+void memcpy_d2h(int device, void* host, const void* dev, size_t bytes) {
+    drain_stream(device);
+    check_xpu(xpu_memcpy(host, dev, bytes, XPU_DEVICE_TO_HOST), "xpu_memcpy D2H");
+    check_xpu(xpu_wait(nullptr), "xpu_wait D2H");
+}
+
+void memcpy_h2d(int device, void* dev, const void* host, size_t bytes) {
+    drain_stream(device);
+    check_xpu(xpu_memcpy(dev, host, bytes, XPU_HOST_TO_DEVICE), "xpu_memcpy H2D");
+    check_xpu(xpu_wait(nullptr), "xpu_wait H2D");
+}
+
+void memcpy_d2d(int device, void* dst, const void* src, size_t bytes) {
+    drain_stream(device);
+    check_xpu(xpu_memcpy(dst, src, bytes, XPU_DEVICE_TO_DEVICE), "xpu_memcpy D2D");
+    check_xpu(xpu_wait(nullptr), "xpu_wait D2D");
+}
+
+void* host_staging_alloc(size_t bytes, bool* pinned) {
+    void* host = nullptr;
+    *pinned = xpu_host_alloc(&host, bytes, 0) == 0 && host != nullptr;
+    if (!*pinned) {
+        host = std::malloc(bytes);
+    }
+    return host;
+}
+
+void host_staging_free(void* host, bool pinned) {
+    if (pinned) {
+        xpu_host_free(host);
+    } else {
+        std::free(host);
+    }
+}
+
 template <typename T>
 T scalar_value(const at::Scalar& value) {
-    return static_cast<T>(value.toDouble());
+    if constexpr (std::is_same_v<T, bool>) {
+        return value.toBool();
+    } else if constexpr (std::is_integral_v<T>) {
+        TORCH_CHECK(!value.isFloatingPoint() || std::trunc(value.toDouble()) == value.toDouble(),
+                    "kunlun fill_ value ", value.toDouble(), " is not an integer");
+        const int64_t v = value.toLong();
+        if constexpr (sizeof(T) < sizeof(int64_t)) {
+            TORCH_CHECK(v >= static_cast<int64_t>(std::numeric_limits<T>::min()) &&
+                            v <= static_cast<int64_t>(std::numeric_limits<T>::max()),
+                        "kunlun fill_ value ", v, " overflows ", sizeof(T) * 8, "-bit dtype");
+        }
+        return static_cast<T>(v);
+    } else {
+        return static_cast<T>(value.toDouble());
+    }
 }
 
 template <>
@@ -69,20 +123,27 @@ at::Tensor add_impl(const at::Tensor& self, const at::Tensor& other, const at::S
 
     const auto out_shape = at::infer_size(self.sizes(), other.sizes());
     auto out = at::empty(out_shape, self.options());
-    ContextGuard guard(self.device().index());
+    ContextGuard guard(self.device().index(), out.numel());
     if (self.sizes().equals(other.sizes())) {
         TORCH_CHECK(baidu::xpu::api::add<T>(
                         guard.dc.ctx, cptr<T>(self), cptr<T>(other), mptr<T>(out),
                         self.numel()) == 0,
                     "xdnn::add failed");
-    } else {
-        // broadcast_add expects the wider operand first; addition is commutative.
-        const at::Tensor& wide = self.dim() >= other.dim() ? self : other;
-        const at::Tensor& narrow = self.dim() >= other.dim() ? other : self;
+    } else if (other.sizes().equals(out_shape)) {
+        // XDNN broadcasts x onto y: x is the narrow operand, y holds the output
+        // shape (see xtcl gemm_impl.h: broadcast_add(ctx, bias, C, C, {N}, {M,N})).
         TORCH_CHECK(baidu::xpu::api::broadcast_add<T>(
-                        guard.dc.ctx, cptr<T>(wide), cptr<T>(narrow), mptr<T>(out),
-                        wide.sizes().vec(), narrow.sizes().vec()) == 0,
+                        guard.dc.ctx, cptr<T>(self), cptr<T>(other), mptr<T>(out),
+                        self.sizes().vec(), out_shape) == 0,
                     "xdnn::broadcast_add failed");
+    } else if (self.sizes().equals(out_shape)) {
+        TORCH_CHECK(baidu::xpu::api::broadcast_add<T>(
+                        guard.dc.ctx, cptr<T>(other), cptr<T>(self), mptr<T>(out),
+                        other.sizes().vec(), out_shape) == 0,
+                    "xdnn::broadcast_add failed");
+    } else {
+        TORCH_CHECK(false, "kunlun add does not support two-way broadcasting: ",
+                    self.sizes(), " + ", other.sizes());
     }
     return out;
 }
@@ -102,9 +163,47 @@ template <typename T>
 at::Tensor& fill_impl(at::Tensor& self, const at::Scalar& value) {
     check_contiguous(self, "fill_");
     const T v = scalar_value<T>(value);
-    ContextGuard guard(self.device().index());
+    ContextGuard guard(self.device().index(), self.numel());
     TORCH_CHECK(baidu::xpu::api::constant<T>(guard.dc.ctx, mptr<T>(self), self.numel(), v) == 0,
                 "xdnn::constant failed");
+    return self;
+}
+
+// XPURT has no memset, so non-floating dtypes are filled by broadcasting a
+// host pattern block.  The DMA length is kept well below the 32-bit limit.
+template <typename T>
+at::Tensor& fill_pattern(at::Tensor& self, T v) {
+    const int64_t numel = self.numel();
+    if (numel == 0) {
+        return self;
+    }
+    // 1 MiB per DMA keeps the transfer count low while staying far below the
+    // runtime's 32-bit length limit.
+    constexpr size_t kChunkBytes = 1ULL << 20;
+    const int64_t max_chunk = static_cast<int64_t>(kChunkBytes / sizeof(T));
+    const int64_t chunk = std::min<int64_t>(numel, std::max<int64_t>(1, max_chunk));
+    const size_t chunk_bytes = static_cast<size_t>(chunk) * sizeof(T);
+    bool pinned = false;
+    void* host = host_staging_alloc(chunk_bytes, &pinned);
+    TORCH_CHECK(host != nullptr, "kunlun fill_ staging allocation failed");
+    auto* pattern = static_cast<unsigned char*>(host);
+    for (int64_t i = 0; i < chunk; ++i) {
+        std::memcpy(pattern + static_cast<size_t>(i) * sizeof(T), &v, sizeof(T));
+    }
+    const size_t total = static_cast<size_t>(numel) * sizeof(T);
+    auto* dst = static_cast<unsigned char*>(self.data_ptr());
+    drain_stream(self.device().index());
+    size_t done = 0;
+    int ret = 0;
+    while (done < total && ret == 0) {
+        const size_t n = std::min(chunk_bytes, total - done);
+        ret = xpu_memcpy(dst + done, pattern, n, XPU_HOST_TO_DEVICE);
+        done += n;
+    }
+    const int wait_ret = xpu_wait(nullptr);
+    host_staging_free(host, pinned);
+    check_xpu(ret, "xpu_memcpy H2D fill_");
+    check_xpu(wait_ret, "xpu_wait fill_");
     return self;
 }
 
@@ -121,7 +220,7 @@ at::Tensor fc_impl(const at::Tensor& x, const at::Tensor& w, bool w_trans) {
     TORCH_CHECK((w_trans ? x.size(1) : w.size(0)) == k, "kunlun fc inner dimensions mismatch");
 
     auto out = at::empty({m, n}, x.options());
-    ContextGuard guard(x.device().index());
+    ContextGuard guard(x.device().index(), m * n * k);
     const int fc_ret = baidu::xpu::api::fc<T, T, T, TGEMM>(
             guard.dc.ctx, cptr<T>(x), cptr<T>(w), mptr<T>(out),
             m, n, k, /*x_trans=*/false, w_trans,
@@ -161,7 +260,7 @@ at::Tensor conv2d_impl(const at::Tensor& input, const at::Tensor& weight,
     TORCH_CHECK(oh > 0 && ow > 0, "kunlun conv2d produced non-positive output shape");
 
     auto out = at::empty({n, f, oh, ow}, input.options());
-    ContextGuard guard(input.device().index());
+    ContextGuard guard(input.device().index(), n * f * oh * ow * c * kh * kw);
     const int conv_ret = baidu::xpu::api::conv2d<T, T, T, TGEMM>(
             guard.dc.ctx, cptr<T>(input), cptr<T>(weight), mptr<T>(out),
             n, c, h, w, f, {kh, kw}, stride_v, pad_v, dilation_v, groups,
@@ -173,10 +272,12 @@ at::Tensor conv2d_impl(const at::Tensor& input, const at::Tensor& weight,
         check_same_dtype(input, *bias, "conv2d bias");
         check_contiguous(*bias, "conv2d bias");
         TORCH_CHECK(bias->numel() == f, "kunlun conv2d bias size mismatch");
+        // XDNN broadcasts with numpy right-alignment, so a {f} shape would be
+        // matched against the W axis; {1,f,1,1} matches the channel axis.
         auto tmp = at::empty_like(out);
         TORCH_CHECK(baidu::xpu::api::broadcast_add<T>(
-                        guard.dc.ctx, cptr<T>(out), cptr<T>(*bias), mptr<T>(tmp),
-                        {n, f, oh, ow}, {f}) == 0,
+                        guard.dc.ctx, cptr<T>(*bias), cptr<T>(out), mptr<T>(tmp),
+                        {1, f, 1, 1}, {n, f, oh, ow}) == 0,
                     "xdnn::broadcast_add (conv2d bias) failed");
         out = tmp;
     }
@@ -191,24 +292,45 @@ at::Tensor materialize_private_contiguous(const at::Tensor& src) {
     if (src.is_contiguous()) {
         return src;
     }
-    const size_t bytes = src.storage().nbytes();
-    if (bytes == 0) {
+    if (src.numel() == 0) {
         return at::empty(src.sizes(), src.options());
     }
-    void* host = nullptr;
-    const bool pinned = xpu_host_alloc(&host, bytes, 0) == 0;
-    if (!pinned) {
-        host = std::malloc(bytes);
-    }
-    TORCH_CHECK(host != nullptr, "kunlun contiguous staging allocation failed");
 
-    xpu_set_device(src.device().index());
-    check_xpu(xpu_memcpy(host, src.storage().data_ptr().get(), bytes, XPU_DEVICE_TO_HOST),
-              "xpu_memcpy D2H staging");
-    check_xpu(xpu_wait(nullptr), "xpu_wait D2H staging");
+    const int64_t elem_size = src.element_size();
+    const int64_t storage_elems =
+        static_cast<int64_t>(src.storage().nbytes()) / elem_size;
+    // Stage only the address range the view touches: the storage may be much
+    // larger than the view (one row of a big matrix, a slice of a buffer), and
+    // copying the whole storage is both slower and an unnecessary DMA.
+    int64_t min_elem = 0;
+    int64_t max_elem = storage_elems - 1;
+    bool negative_stride = false;
+    for (int64_t d = 0; d < src.dim(); ++d) {
+        negative_stride = negative_stride || src.stride(d) < 0;
+    }
+    if (!negative_stride) {
+        min_elem = src.storage_offset();
+        max_elem = min_elem;
+        for (int64_t d = 0; d < src.dim(); ++d) {
+            if (src.size(d) > 1) {
+                max_elem += (src.size(d) - 1) * src.stride(d);
+            }
+        }
+        TORCH_CHECK(min_elem >= 0 && max_elem >= min_elem && max_elem < storage_elems,
+                    "kunlun contiguous materialization found an out-of-range view");
+    }
+    const size_t offset_bytes = static_cast<size_t>(min_elem) * elem_size;
+    const size_t bytes = static_cast<size_t>(max_elem - min_elem + 1) * elem_size;
+
+    bool pinned = false;
+    void* host = host_staging_alloc(bytes, &pinned);
+    TORCH_CHECK(host != nullptr, "kunlun contiguous staging allocation failed");
+    const int device = src.device().index();
+    const auto* base = static_cast<const unsigned char*>(src.storage().data_ptr().get());
+    memcpy_d2h(device, host, base + offset_bytes, bytes);
 
     auto cpu_bytes = at::from_blob(
-        host, {static_cast<int64_t>(bytes / src.element_size())},
+        host, {static_cast<int64_t>(bytes / elem_size)},
         [pinned](void* ptr) {
             if (pinned) {
                 xpu_host_free(ptr);
@@ -217,15 +339,13 @@ at::Tensor materialize_private_contiguous(const at::Tensor& src) {
             }
         },
         src.options().device(at::kCPU));
-    auto cpu_view = cpu_bytes.as_strided(src.sizes(), src.strides(), src.storage_offset());
+    auto cpu_view = cpu_bytes.as_strided(src.sizes(), src.strides(),
+                                         src.storage_offset() - min_elem);
     auto cpu_contig = cpu_view.contiguous();
 
     auto dst = at::empty(src.sizes(), src.options());
-    xpu_set_device(src.device().index());
-    check_xpu(xpu_memcpy(dst.data_ptr(), cpu_contig.data_ptr(),
-                         cpu_contig.numel() * cpu_contig.element_size(), XPU_HOST_TO_DEVICE),
-              "xpu_memcpy H2D staging");
-    check_xpu(xpu_wait(nullptr), "xpu_wait H2D staging");
+    memcpy_h2d(device, dst.data_ptr(), cpu_contig.data_ptr(),
+               cpu_contig.numel() * cpu_contig.element_size());
     return dst;
 }
 
@@ -236,6 +356,13 @@ at::Tensor& copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     // more bytes from src than its allocation owns.
     TORCH_CHECK(self.sizes().equals(src.sizes()),
                 "kunlun copy_ requires equal shapes; broadcast copy is not implemented");
+    if (self.data_ptr() == src.data_ptr() && self.device() == src.device() &&
+        src.is_contiguous()) {
+        // Same contiguous storage and byte range: nothing to move.  A
+        // non-contiguous src with the same base pointer (x.copy_(x.t()) on a
+        // square tensor) is a real transpose and must still be copied.
+        return self;
+    }
     at::Tensor source;
     if (src.is_contiguous()) {
         source = src;
@@ -254,58 +381,39 @@ at::Tensor& copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
 
     if (self_type == c10::DeviceType::PrivateUse1 &&
         src_type == c10::DeviceType::CPU) {
-        xpu_set_device(self.device().index());
-        check_xpu(xpu_memcpy(self.data_ptr(), source.data_ptr(), bytes, XPU_HOST_TO_DEVICE),
-                  "xpu_memcpy H2D");
+        memcpy_h2d(self.device().index(), self.data_ptr(), source.data_ptr(), bytes);
     } else if (self_type == c10::DeviceType::CPU &&
                src_type == c10::DeviceType::PrivateUse1) {
-        xpu_set_device(source.device().index());
-        check_xpu(xpu_memcpy(self.data_ptr(), source.data_ptr(), bytes, XPU_DEVICE_TO_HOST),
-                  "xpu_memcpy D2H");
+        memcpy_d2h(source.device().index(), self.data_ptr(), source.data_ptr(), bytes);
     } else if (self_type == c10::DeviceType::PrivateUse1 &&
                src_type == c10::DeviceType::PrivateUse1) {
         const int dst_device = self.device().index();
         const int src_device = source.device().index();
-        if (dst_device == src_device) {
-            xpu_set_device(dst_device);
-            check_xpu(xpu_memcpy(self.data_ptr(), source.data_ptr(), bytes,
-                                 XPU_DEVICE_TO_DEVICE),
-                      "xpu_memcpy D2D");
+        const auto dst_addr = reinterpret_cast<uintptr_t>(self.data_ptr());
+        const auto src_addr = reinterpret_cast<uintptr_t>(source.data_ptr());
+        // Partially overlapping ranges inside one storage (x[1:].copy_(x[:-1]))
+        // cannot be copied in place; stage through the host instead.
+        const bool overlap = dst_addr < src_addr + bytes && src_addr < dst_addr + bytes;
+        if (dst_device == src_device && !overlap) {
+            memcpy_d2d(dst_device, self.data_ptr(), source.data_ptr(), bytes);
         } else {
-            // Cross-PD/cross-card: host staging.  This avoids relying on
-            // xpu_memcpy_peer, which is supported only for same-card PDs.
-            void* host = nullptr;
-            bool pinned = xpu_host_alloc(&host, bytes, 0) == 0;
-            if (!pinned) {
-                host = std::malloc(bytes);
-            }
+            // Cross-PD staging also covers the overlap case.  This avoids
+            // xpu_memcpy_peer, which only works between same-card PDs.
+            bool pinned = false;
+            void* host = host_staging_alloc(bytes, &pinned);
             TORCH_CHECK(host != nullptr, "kunlun copy_ host staging allocation failed");
-            xpu_set_device(src_device);
-            check_xpu(xpu_memcpy(host, source.data_ptr(), bytes, XPU_DEVICE_TO_HOST),
-                      "xpu_memcpy D2H staging");
-            check_xpu(xpu_wait(nullptr), "xpu_wait D2H staging");
-            xpu_set_device(dst_device);
-            check_xpu(xpu_memcpy(self.data_ptr(), host, bytes, XPU_HOST_TO_DEVICE),
-                      "xpu_memcpy H2D staging");
-            check_xpu(xpu_wait(nullptr), "xpu_wait H2D staging");
-            if (pinned) {
-                xpu_host_free(host);
-            } else {
-                std::free(host);
-            }
+            memcpy_d2h(src_device, host, source.data_ptr(), bytes);
+            memcpy_h2d(dst_device, self.data_ptr(), host, bytes);
+            host_staging_free(host, pinned);
         }
     } else {
         TORCH_CHECK(false, "kunlun copy_ unsupported device combination");
     }
 
-    // Host-staged copies must not outlive the caller's CPU buffer.  XPURT has
-    // no stream-aware memcpy, so treat CPU<->device copies as synchronous even
-    // when PyTorch requests non_blocking=True.
-    const bool host_copy = self_type == c10::DeviceType::CPU ||
-                           src_type == c10::DeviceType::CPU;
-    if (!non_blocking || host_copy) {
-        synchronize();
-    }
+    // xpu_memcpy is synchronous: every branch above completed the transfer
+    // before returning, so non_blocking cannot defer anything.  XPURT has no
+    // stream-aware memcpy and the host staging buffer is released here.
+    (void)non_blocking;
     return self;
 }
 
@@ -387,13 +495,45 @@ at::Tensor linear(const at::Tensor& input, const at::Tensor& weight,
 }
 
 at::Tensor& fill_(at::Tensor& self, const at::Scalar& value) {
-    if (self.scalar_type() == at::kHalf) {
-        return fill_impl<float16>(self, value);
+    if (!self.is_contiguous()) {
+        // XDNN constant and the host-pattern path both write a contiguous
+        // range.  Walk the outer dimension instead of staging the whole
+        // tensor; the recursion stops at contiguous sub-tensors.  Small
+        // tensors only: a transposed large view would otherwise turn into one
+        // tiny DMA per element.
+        constexpr int64_t kMaxStridedFill = 1 << 12;
+        TORCH_CHECK(self.numel() <= kMaxStridedFill,
+                    "kunlun fill_ on a non-contiguous tensor is limited to ",
+                    kMaxStridedFill, " elements; materialize it with .contiguous() first");
+        TORCH_CHECK(self.dim() > 0, "kunlun fill_ requires a contiguous tensor");
+        for (int64_t i = 0; i < self.size(0); ++i) {
+            auto row = self.select(0, i);
+            fill_(row, value);
+        }
+        return self;
     }
-    if (self.scalar_type() == at::kFloat) {
-        return fill_impl<float>(self, value);
+    switch (self.scalar_type()) {
+        case at::kHalf:
+            return fill_impl<float16>(self, value);
+        case at::kFloat:
+            return fill_impl<float>(self, value);
+        case at::kDouble:
+            return fill_pattern<double>(self, scalar_value<double>(value));
+        case at::kBool:
+            return fill_pattern<bool>(self, scalar_value<bool>(value));
+        case at::kByte:
+            return fill_pattern<uint8_t>(self, scalar_value<uint8_t>(value));
+        case at::kChar:
+            return fill_pattern<int8_t>(self, scalar_value<int8_t>(value));
+        case at::kShort:
+            return fill_pattern<int16_t>(self, scalar_value<int16_t>(value));
+        case at::kInt:
+            return fill_pattern<int32_t>(self, scalar_value<int32_t>(value));
+        case at::kLong:
+            return fill_pattern<int64_t>(self, scalar_value<int64_t>(value));
+        default:
+            TORCH_CHECK(false, "kunlun fill_ does not support dtype ", self.scalar_type());
     }
-    TORCH_CHECK(false, "kunlun fill_ only supports float16/float32");
     return self;
 }
 
@@ -460,24 +600,10 @@ at::Tensor conv2d(const at::Tensor& input, const at::Tensor& weight,
     return {};
 }
 
-std::atomic<size_t>& cpu_fallback_count() {
-    static std::atomic<size_t> count{0};
-    return count;
-}
-
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
-    const char* mode = std::getenv("KUNLUN_CPU_FALLBACK");
-    const std::string policy = mode == nullptr ? "warn" : mode;
     const std::string name = op.schema().name();
-    if (policy == "error") {
-        TORCH_CHECK(false, "kunlun CPU fallback disabled (KUNLUN_CPU_FALLBACK=error): ", name);
-    }
-    const size_t count = ++cpu_fallback_count();
-    if (policy != "silent") {
-        std::fprintf(stderr,
-                     "kunlun CPU fallback #%zu: %s (set KUNLUN_CPU_FALLBACK=error to reject)\n",
-                     count, name.c_str());
-    }
+    // No PrivateUse1 kernel exists for this op: deny unless the user opts in.
+    check_generic_fallback(name.c_str());
     at::native::cpu_fallback(op, stack);
 }
 

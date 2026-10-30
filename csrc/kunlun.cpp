@@ -10,18 +10,280 @@
 
 #include "xpu/refactor/context/newcontext.h"
 
+#include <dlfcn.h>
+#include <link.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace torch_kunlun {
 
 void check_xpu(int ret, const char* what) {
     TORCH_CHECK(ret == 0, what, " failed: ret=", ret, " (", xpu_strerror(ret), ")");
+}
+
+namespace {
+
+// A K200 PD exposes 4 clusters and 4 SDNN engines, and XDNN rejects a larger
+// launch (Context::set_ncluster returns -1).
+constexpr int kMaxClusters = 4;
+constexpr int kMaxSdnn = 4;
+
+int env_int(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) return fallback;
+    return static_cast<int>(parsed);
+}
+
+std::atomic<int>& cluster_budget_ref() {
+    static std::atomic<int> budget{
+        std::min(kMaxClusters, std::max(1, env_int("KUNLUN_NCLUSTER", kMaxClusters)))};
+    return budget;
+}
+
+std::atomic<int>& sdnn_budget_ref() {
+    static std::atomic<int> budget{
+        std::min(kMaxSdnn, std::max(1, env_int("KUNLUN_NSDNN", kMaxSdnn)))};
+    return budget;
+}
+
+bool auto_cluster_policy() {
+    static const bool enabled = [] {
+        const char* mode = std::getenv("KUNLUN_CLUSTER_POLICY");
+        return mode != nullptr && std::strcmp(mode, "auto") == 0;
+    }();
+    return enabled;
+}
+
+// Small launches leave three clusters idle instead of paying the
+// cluster-cooperative launch cost.
+constexpr int64_t kAutoSmallWork = 1LL << 22;
+
+void apply_cluster_policy(DeviceContext& dc, int64_t work_elems) {
+    int ncluster = cluster_budget_ref().load();
+    int nsdnn = sdnn_budget_ref().load();
+    if (auto_cluster_policy() && work_elems > 0 && work_elems < kAutoSmallWork) {
+        ncluster = 1;
+        nsdnn = 1;
+    }
+    // The vendor calls may reallocate the context workspace, so only issue
+    // them when the requested policy actually changed.
+    if (dc.active_ncluster != ncluster) {
+        if (dc.ctx->set_ncluster(ncluster) != 0) {
+            ncluster = kMaxClusters;
+            dc.ctx->set_ncluster(ncluster);
+        }
+        dc.active_ncluster = ncluster;
+    }
+    if (dc.active_nsdnn != nsdnn) {
+        if (dc.ctx->set_nsdnn(nsdnn) != 0) {
+            nsdnn = kMaxSdnn;
+            dc.ctx->set_nsdnn(nsdnn);
+        }
+        dc.active_nsdnn = nsdnn;
+    }
+}
+
+}  // namespace
+
+int set_cluster_budget(int nclusters, int nsdnn) {
+    TORCH_CHECK(nclusters >= 1 && nclusters <= kMaxClusters,
+                "kunlun cluster budget must be 1..", kMaxClusters, ", got ", nclusters);
+    TORCH_CHECK(nsdnn >= 1 && nsdnn <= kMaxSdnn,
+                "kunlun SDNN budget must be 1..", kMaxSdnn, ", got ", nsdnn);
+    cluster_budget_ref().store(nclusters);
+    sdnn_budget_ref().store(nsdnn);
+    return nclusters;
+}
+
+int cluster_budget() {
+    return cluster_budget_ref().load();
+}
+
+int sdnn_budget() {
+    return sdnn_budget_ref().load();
+}
+
+namespace {
+
+// The loaded libxpuapi carries a literal XDNN_VERSION_<version> tag.  The tag
+// lives in whichever module owns the XDNN symbols: the vendor .so when linked
+// dynamically, or this extension when libxpuapi is linked statically.
+std::string scan_xdnn_version(const char* path) {
+    if (path == nullptr || *path == '\0') return {};
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    static constexpr char kNeedle[] = "XDNN_VERSION_";
+    constexpr size_t kNeedleLen = sizeof(kNeedle) - 1;
+    constexpr size_t kChunk = 1U << 20;
+    std::vector<char> buf(kChunk);
+    std::string carry;
+    while (in) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const auto got = static_cast<size_t>(in.gcount());
+        if (got == 0) break;
+        std::string chunk = carry + std::string(buf.data(), got);
+        const size_t pos = chunk.find(kNeedle);
+        if (pos != std::string::npos) {
+            size_t end = pos + kNeedleLen;
+            while (end < chunk.size()) {
+                const char c = chunk[end];
+                const bool ident = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                                   (c >= 'A' && c <= 'Z') || c == '.' || c == '-' ||
+                                   c == '_';
+                if (!ident) break;
+                ++end;
+            }
+            return chunk.substr(pos + kNeedleLen, end - (pos + kNeedleLen));
+        }
+        carry = chunk.size() > kNeedleLen ? chunk.substr(chunk.size() - kNeedleLen) : chunk;
+    }
+    return {};
+}
+
+// dladdr(&create_context) resolves to this module's PLT slot when XDNN is
+// linked dynamically, so the version tag in libxpuapi would be missed.  Scan
+// the loaded objects whose names look like XDNN instead.
+int scan_loaded_xdnn(struct dl_phdr_info* info, size_t, void* data) {
+    auto* found = static_cast<std::string*>(data);
+    if (!found->empty()) return 1;
+    if (info->dlpi_name == nullptr || *info->dlpi_name == '\0') return 0;
+    const std::string path = info->dlpi_name;
+    const auto slash = path.find_last_of('/');
+    const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (base.find("xpuapi") == std::string::npos && base.find("xdnn") == std::string::npos) {
+        return 0;
+    }
+    *found = scan_xdnn_version(path.c_str());
+    return found->empty() ? 0 : 1;
+}
+
+}  // namespace
+
+std::string xdnn_version() {
+    static const std::string version = [] {
+        const char* force = std::getenv("KUNLUN_XDNN_VERSION");
+        if (force != nullptr && *force != '\0') return std::string(force);
+        std::string found;
+        dl_iterate_phdr(&scan_loaded_xdnn, &found);
+        if (!found.empty()) return found;
+        Dl_info info;
+        if (dladdr(reinterpret_cast<void*>(&baidu::xpu::api::create_context), &info) != 0) {
+            found = scan_xdnn_version(info.dli_fname);
+            if (!found.empty()) return found;
+        }
+        if (dladdr(reinterpret_cast<void*>(&torch_kunlun::device_count), &info) != 0) {
+            found = scan_xdnn_version(info.dli_fname);
+        }
+        return found;
+    }();
+    return version;
+}
+
+void check_xdnn_runtime() {
+    if (std::getenv("KUNLUN_SKIP_XDNN_VERSION_CHECK") != nullptr) return;
+    const std::string version = xdnn_version();
+    const char* require = std::getenv("KUNLUN_XDNN_REQUIRE");
+    if (require != nullptr && *require != '\0') {
+        TORCH_CHECK(version.find(require) != std::string::npos,
+                    "kunlun: loaded XDNN version '", version,
+                    "' does not contain KUNLUN_XDNN_REQUIRE='", require, "'");
+        return;
+    }
+    if (version.empty()) {
+        std::fprintf(stderr,
+                     "kunlun: could not detect the loaded XDNN version; this build targets "
+                     "XDNN 2.0.x headers, so verify libxpuapi matches\n");
+        return;
+    }
+    if (std::getenv("KUNLUN_XDNN_ALLOW_MISMATCH") != nullptr) return;
+    // 2.4 changed argument lists for max_pool2d/adaptive_avg_pool2d/concat, so
+    // a 2.0-compiled extension calling a 2.4 runtime is not ABI-safe.
+    if (version.rfind("2.0.", 0) != 0) {
+        std::fprintf(stderr,
+                     "kunlun: WARNING loaded XDNN %s, but this extension was compiled against "
+                     "XDNN 2.0.x headers; XDNN calls may be ABI-mismatched. "
+                     "Rebuild against the matching headers, or set "
+                     "KUNLUN_XDNN_ALLOW_MISMATCH=1 to silence.\n",
+                     version.c_str());
+    }
+}
+
+namespace {
+
+std::mutex& pin_mu() {
+    static std::mutex m;
+    return m;
+}
+
+std::map<uintptr_t, size_t>& pin_allocs() {
+    static std::map<uintptr_t, size_t> allocs;
+    return allocs;
+}
+
+void register_pin(void* ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(pin_mu());
+    pin_allocs()[reinterpret_cast<uintptr_t>(ptr)] = size;
+}
+
+void unregister_pin(void* ptr) {
+    std::lock_guard<std::mutex> lock(pin_mu());
+    pin_allocs().erase(reinterpret_cast<uintptr_t>(ptr));
+}
+
+class PinnedHostAllocator final : public c10::Allocator {
+public:
+    c10::DataPtr allocate(size_t n) override {
+        if (n == 0) {
+            return c10::DataPtr(nullptr, c10::Device(c10::DeviceType::CPU));
+        }
+        void* ptr = nullptr;
+        const int ret = xpu_host_alloc(&ptr, n, 0);
+        TORCH_CHECK(ret == 0 && ptr != nullptr,
+                    "kunlun pinned host allocation of ", n, " bytes failed: ret=", ret);
+        register_pin(ptr, n);
+        return c10::DataPtr(ptr, ptr, &PinnedHostAllocator::deleter,
+                            c10::Device(c10::DeviceType::CPU));
+    }
+
+    c10::DeleterFnPtr raw_deleter() const override {
+        return &PinnedHostAllocator::deleter;
+    }
+
+private:
+    static void deleter(void* ptr) {
+        if (ptr == nullptr) return;
+        unregister_pin(ptr);
+        xpu_host_free(ptr);
+    }
+};
+
+}  // namespace
+
+bool is_pinned_ptr(const void* ptr) {
+    if (ptr == nullptr) return false;
+    std::lock_guard<std::mutex> lock(pin_mu());
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    auto it = pin_allocs().upper_bound(addr);
+    if (it == pin_allocs().begin()) return false;
+    --it;
+    return addr < it->first + it->second;
+}
+
+c10::Allocator* get_pinned_allocator() {
+    static PinnedHostAllocator allocator;
+    return &allocator;
 }
 
 int device_count() {
@@ -46,19 +308,70 @@ void synchronize() {
     synchronize_all();
 }
 
+namespace {
+
+enum class FallbackPolicy { Default, Error, Warn, Silent };
+
+// Unset means "no generic fallback, but deliberate host-staged kernels are
+// allowed with a notice".  A generic CPU hop hides missing device coverage and
+// moves activations across the host link, so it must be opt-in.
+FallbackPolicy fallback_policy() {
+    static const FallbackPolicy policy = [] {
+        const char* mode = std::getenv("KUNLUN_CPU_FALLBACK");
+        const std::string value = mode == nullptr ? "" : mode;
+        if (value == "silent") return FallbackPolicy::Silent;
+        if (value == "warn") return FallbackPolicy::Warn;
+        if (value == "error") return FallbackPolicy::Error;
+        return FallbackPolicy::Default;
+    }();
+    return policy;
+}
+
+// Prints at most once per operator so a training loop does not flood stderr.
+bool first_notice(const char* op) {
+    static std::mutex mu;
+    static std::vector<std::string> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    const std::string name = op == nullptr ? "" : op;
+    if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
+        return false;
+    }
+    seen.push_back(name);
+    return true;
+}
+
+}  // namespace
+
 void note_cpu_fallback(const char* op) {
     static std::atomic<size_t> count{0};
-    const char* mode = std::getenv("KUNLUN_CPU_FALLBACK");
-    const std::string policy = mode == nullptr ? "warn" : mode;
-    if (policy == "error") {
-        TORCH_CHECK(false, "kunlun CPU fallback disabled (KUNLUN_CPU_FALLBACK=error): ", op);
-    }
+    const FallbackPolicy policy = fallback_policy();
+    TORCH_CHECK(policy != FallbackPolicy::Error,
+                "kunlun operator '", op,
+                "' is implemented by staging tensors through the CPU, which "
+                "KUNLUN_CPU_FALLBACK=error rejects.  Unset the variable (or use "
+                "warn/silent) to allow deliberate host-staged kernels.");
     const size_t n = ++count;
-    if (policy != "silent") {
+    if (policy != FallbackPolicy::Silent && first_notice(op)) {
         std::fprintf(stderr,
-                     "kunlun CPU fallback #%zu: %s (set KUNLUN_CPU_FALLBACK=error to reject)\n",
+                     "kunlun host-staged implementation #%zu: %s "
+                     "(KUNLUN_CPU_FALLBACK=silent hides this)\n",
                      n, op);
     }
+}
+
+void check_generic_fallback(const char* op) {
+    const FallbackPolicy policy = fallback_policy();
+    if (policy == FallbackPolicy::Silent) {
+        return;
+    }
+    if (policy == FallbackPolicy::Warn) {
+        std::fprintf(stderr, "kunlun CPU fallback: %s\n", op);
+        return;
+    }
+    TORCH_CHECK(false,
+                "kunlun has no device implementation for '", op,
+                "'; the generic CPU fallback is disabled by default. Set "
+                "KUNLUN_CPU_FALLBACK=warn (or silent) to allow it.");
 }
 
 namespace {
@@ -158,7 +471,16 @@ void destroy_stream(uint64_t stream_id) {
         current_streams[handle->device] == handle) {
         current_streams[handle->device] = default_stream_handle(handle->device);
     }
+    int old_device = 0;
+    const bool have_device = xpu_current_device(&old_device) == 0;
+    xpu_set_device(handle->device);
+    // Drain first: destroying a stream with in-flight work would invalidate
+    // launches that already captured it.
+    xpu_wait(handle->stream);
     xpu_stream_destroy(handle->stream);
+    if (have_device) {
+        xpu_set_device(old_device);
+    }
     delete handle;
 }
 
@@ -174,7 +496,14 @@ void set_current_stream(uint64_t stream_id) {
 void synchronize_stream(uint64_t stream_id) {
     auto* handle = stream_from_id(stream_id);
     TORCH_CHECK(handle != nullptr, "invalid kunlun stream id");
-    check_xpu(xpu_wait(handle->stream), "xpu_wait(stream)");
+    int old_device = 0;
+    const bool have_device = xpu_current_device(&old_device) == 0;
+    xpu_set_device(handle->device);
+    const int ret = xpu_wait(handle->stream);
+    if (have_device) {
+        xpu_set_device(old_device);
+    }
+    check_xpu(ret, "xpu_wait(stream)");
 }
 
 XPUStream current_stream_native(int device) {
@@ -192,8 +521,15 @@ void synchronize_all() {
             }
         }
     }
+    int old_device = 0;
+    const bool have_device = xpu_current_device(&old_device) == 0;
     for (auto* h : handles) {
+        // xpu_wait interprets the handle in the current device's context.
+        xpu_set_device(h->device);
         xpu_wait(h->stream);
+    }
+    if (have_device) {
+        xpu_set_device(old_device);
     }
 }
 
@@ -249,10 +585,12 @@ DeviceContext::DeviceContext(int device_) : device(device_), ctx(nullptr) {
     xpu_set_device(device);
     ctx = baidu::xpu::api::create_context();
     TORCH_CHECK(ctx != nullptr, "xdnn::create_context failed for device ", device);
-    // K200: 4 clusters, 4 SDNN.  Ignore a rejection so the runtime can still
-    // be used on a different partition.
-    ctx->set_ncluster(4);
-    ctx->set_nsdnn(4);
+    // Ignore a rejection so the runtime can still be used on a partition with
+    // fewer clusters; ContextGuard re-applies the policy per launch.
+    const int ncluster = cluster_budget_ref().load();
+    const int nsdnn = sdnn_budget_ref().load();
+    active_ncluster = ctx->set_ncluster(ncluster) == 0 ? ncluster : 0;
+    active_nsdnn = ctx->set_nsdnn(nsdnn) == 0 ? nsdnn : 0;
     ctx->set_stream(nullptr);
 }
 
@@ -281,6 +619,21 @@ DeviceContext& get_context(int device) {
         contexts[device] = new DeviceContext(device);
     }
     return *contexts[device];
+}
+
+ContextGuard::ContextGuard(int device, int64_t work_elems)
+    : dc(get_context(device)), lock_(dc.mu) {
+    xpu_set_device(dc.device);
+    XPUStream want = current_stream_native(dc.device);
+    if (dc.active_stream != nullptr && dc.active_stream != want) {
+        // The context owns one launch stream and a shared workspace, so a
+        // launch on another stream must drain the previous one first.  Ops on
+        // the same stream still pipeline.
+        check_xpu(xpu_wait(dc.active_stream), "xpu_wait(context stream switch)");
+    }
+    dc.active_stream = want;
+    dc.ctx->set_stream(want);
+    apply_cluster_policy(dc, work_elems);
 }
 
 namespace {
@@ -419,13 +772,12 @@ struct KunlunHooksInterface final : at::PrivateUse1HooksInterface {
         return at::Device(at::DeviceType::PrivateUse1, device);
     }
 
-    bool isPinnedPtr(const void*) const override {
-        return false;
+    bool isPinnedPtr(const void* ptr) const override {
+        return torch_kunlun::is_pinned_ptr(ptr);
     }
 
     c10::Allocator* getPinnedMemoryAllocator() const override {
-        TORCH_CHECK(false, "kunlun: pinned host memory is not implemented in the basic runtime");
-        return nullptr;
+        return torch_kunlun::get_pinned_allocator();
     }
 
     c10::DeviceIndex deviceCount() const override {
@@ -464,6 +816,9 @@ const bool kRegistered = [] {
     c10::register_privateuse1_backend("kunlun");
     c10::SetAllocator(c10::DeviceType::PrivateUse1, get_allocator());
     at::RegisterPrivateUse1HooksInterface(new KunlunHooksInterface());
+    // File-only check: does not touch XPURT, so importing on a host without
+    // the K200 driver stays safe.
+    check_xdnn_runtime();
     return true;
 }();
 
@@ -480,8 +835,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("adam_step", &torch_kunlun::adam_step);
     m.def("adamw_step", &torch_kunlun::adamw_step);
     m.def("empty_cache", &torch_kunlun::empty_cache);
+    m.def("set_cluster_budget", &torch_kunlun::set_cluster_budget);
+    m.def("cluster_budget", &torch_kunlun::cluster_budget);
+    m.def("sdnn_budget", &torch_kunlun::sdnn_budget);
+    m.def("xdnn_version", &torch_kunlun::xdnn_version);
+    m.def("is_pinned_ptr", [](uint64_t ptr) {
+        return torch_kunlun::is_pinned_ptr(reinterpret_cast<const void*>(ptr));
+    });
 
     m.def("current_stream", &torch_kunlun::current_stream_id);
+    // The raw XPUStream, as an integer, for callers that hand it straight to the
+    // runtime (the Triton launcher) instead of through create_stream/set_stream.
+    m.def("current_stream_native", [](int device) {
+        return static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(torch_kunlun::current_stream_native(device)));
+    });
     m.def("default_stream", &torch_kunlun::default_stream_id);
     m.def("create_stream", &torch_kunlun::create_stream);
     m.def("destroy_stream", &torch_kunlun::destroy_stream);

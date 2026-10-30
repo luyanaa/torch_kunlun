@@ -34,17 +34,18 @@ void check_bkcl(BKCLResult_t ret, const char* what) {
 }
 
 BKCLDataType to_bkcl_dtype(at::ScalarType dtype) {
+    // KL1 collective coverage is only established for FP32/FP16/INT32.  The
+    // BKCL enum also lists BF16/FLOAT64/INT64/UINT8, but the KL1 kernels for
+    // them are unverified, and UINT8 would silently accept bool/uint8 tensors
+    // (masks, indices) that must never be reduced.
     switch (dtype) {
         case at::kFloat: return BKCL_FLOAT;
         case at::kHalf: return BKCL_FLOAT16;
-        case at::kBFloat16: return BKCL_BFLOAT16;
-        case at::kDouble: return BKCL_FLOAT64;
         case at::kInt: return BKCL_INT32;
-        case at::kLong: return BKCL_INT64;
-        case at::kByte:
-        case at::kBool: return BKCL_UINT8;
         default:
-            TORCH_CHECK(false, "kunlun xccl unsupported dtype ", dtype);
+            TORCH_CHECK(false,
+                        "kunlun xccl unsupported dtype ", dtype,
+                        " (KL1 supports float32/float16/int32 collectives only)");
     }
 }
 
@@ -164,6 +165,10 @@ void xccl_reduce_scatter(const at::Tensor& out, const at::Tensor& input,
 void xccl_barrier(int device) {
     TORCH_CHECK(xccl_ctx() != nullptr, "kunlun xccl is not initialized");
     xpu_set_device(device);
+    // bkcl_barrier has no stream argument: it is a host-side rendezvous.  Drain
+    // this rank's stream first so the barrier is not reported while this
+    // rank's own kernels are still queued behind it.
+    check_xpu(xpu_wait(current_stream_native(device)), "xpu_wait(barrier drain)");
     check_bkcl(bkcl_barrier(xccl_ctx()), "bkcl_barrier");
 }
 

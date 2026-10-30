@@ -23,17 +23,6 @@ using torch::autograd::AutogradContext;
 using torch::autograd::Function;
 using torch::autograd::variable_list;
 
-struct ContextGuard {
-    DeviceContext& dc;
-    std::unique_lock<std::mutex> lock;
-
-    explicit ContextGuard(int device)
-        : dc(get_context(device)), lock(dc.mu) {
-        xpu_set_device(dc.device);
-        dc.ctx->set_stream(current_stream_native(dc.device));
-    }
-};
-
 void check_tensor(const at::Tensor& t, const char* what) {
     TORCH_CHECK(t.device().type() == at::DeviceType::PrivateUse1,
                 what, " requires a kunlun tensor");
@@ -347,7 +336,7 @@ public:
         return out;
     }
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
-        auto grad = grad_outputs[0];
+        auto grad = grad_outputs[0].contiguous();
         const double factor = ctx->saved_data["factor"].toDouble();
         if (grad.scalar_type() == at::kHalf) {
             return {scale_impl<float16>(grad, factor), at::Tensor()};
@@ -547,7 +536,7 @@ public:
         auto dims = ctx->saved_data["dims"].toIntVector();
         bool keepdim = ctx->saved_data["keepdim"].toBool();
         const int64_t count = ctx->saved_data["count"].toInt();
-        auto g = grad_outputs[0];
+        auto g = grad_outputs[0].contiguous();
         if (self.scalar_type() == at::kHalf) {
             g = scale_impl<float16>(g, 1.0 / static_cast<double>(count));
         } else {
@@ -662,7 +651,7 @@ public:
         return out;
     }
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
-        auto grad = grad_outputs[0];
+        auto grad = grad_outputs[0].contiguous();
         const int64_t diagonal = ctx->saved_data["diagonal"].toInt();
         const bool upper = ctx->saved_data["upper"].toBool();
         at::AutoDispatchBelowAutograd guard;
@@ -831,7 +820,7 @@ public:
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
         auto saved = ctx->get_saved_variables();
         auto a = saved[0]; auto b = saved[1];
-        auto grad = grad_outputs[0];
+        auto grad = grad_outputs[0].contiguous();
         const double value = ctx->saved_data["value"].toDouble();
         at::AutoDispatchBelowAutograd guard;
         auto da = scale_impl_dispatch(at::mul(grad, b), value);
@@ -853,7 +842,7 @@ public:
     static variable_list backward(AutogradContext* ctx, variable_list grad_outputs) {
         auto saved = ctx->get_saved_variables();
         auto a = saved[0]; auto b = saved[1];
-        auto grad = grad_outputs[0];
+        auto grad = grad_outputs[0].contiguous();
         const double value = ctx->saved_data["value"].toDouble();
         at::AutoDispatchBelowAutograd guard;
         auto da = scale_impl_dispatch(at::div(grad, b), value);

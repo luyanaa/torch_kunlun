@@ -19,15 +19,6 @@ using torch::autograd::AutogradContext;
 using torch::autograd::Function;
 using torch::autograd::variable_list;
 
-struct ContextGuard {
-    DeviceContext& dc;
-    std::unique_lock<std::mutex> lock;
-    explicit ContextGuard(int device) : dc(get_context(device)), lock(dc.mu) {
-        xpu_set_device(dc.device);
-        dc.ctx->set_stream(current_stream_native(dc.device));
-    }
-};
-
 void check_tensor(const at::Tensor& t, const char* what) {
     TORCH_CHECK(t.device().type() == at::DeviceType::PrivateUse1,
                 what, " requires a kunlun tensor");

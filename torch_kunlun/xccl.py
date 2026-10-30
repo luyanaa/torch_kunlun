@@ -204,8 +204,9 @@ class ProcessGroupXCCL(dist.ProcessGroup):
         return _XCCLWork(True)
 
     def barrier(self, opts=None):
+        # xccl_barrier drains this rank's stream before joining the rendezvous,
+        # so the barrier cannot be reported ahead of locally queued work.
         _C.xccl_barrier(self._device())
-        _C.synchronize()
         return _XCCLWork(True)
 
     def shutdown(self):
