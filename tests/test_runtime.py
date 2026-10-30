@@ -39,6 +39,17 @@ def test_add_relu():
     assert torch.allclose(r.cpu(), torch.relu(a.cpu() + b.cpu()), atol=1e-2, rtol=1e-2)
 
 
+def test_add_broadcast():
+    a = torch.randn(4, 8, dtype=torch.float16).to("kunlun")
+    b = torch.randn(8, dtype=torch.float16).to("kunlun")
+    wide_first = torch.add(a, b)
+    narrow_first = torch.add(b, a)
+    kunlun.synchronize()
+    ref = a.cpu() + b.cpu()
+    assert torch.allclose(wide_first.cpu(), ref, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(narrow_first.cpu(), ref, atol=1e-2, rtol=1e-2)
+
+
 def test_mm_fp16():
     a = torch.randn(16, 32, dtype=torch.float16)
     b = torch.randn(32, 24, dtype=torch.float16)

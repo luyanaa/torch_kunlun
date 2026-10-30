@@ -66,7 +66,6 @@ at::Tensor add_impl(const at::Tensor& self, const at::Tensor& other, const at::S
     check_same_dtype(self, other, "add");
     check_contiguous(self, "add");
     check_contiguous(other, "add");
-    TORCH_CHECK(self.sizes().equals(other.sizes()), "kunlun add requires equal shapes");
 
     const auto out_shape = at::infer_size(self.sizes(), other.sizes());
     auto out = at::empty(out_shape, self.options());
@@ -77,9 +76,12 @@ at::Tensor add_impl(const at::Tensor& self, const at::Tensor& other, const at::S
                         self.numel()) == 0,
                     "xdnn::add failed");
     } else {
+        // broadcast_add expects the wider operand first; addition is commutative.
+        const at::Tensor& wide = self.dim() >= other.dim() ? self : other;
+        const at::Tensor& narrow = self.dim() >= other.dim() ? other : self;
         TORCH_CHECK(baidu::xpu::api::broadcast_add<T>(
-                        guard.dc.ctx, cptr<T>(self), cptr<T>(other), mptr<T>(out),
-                        self.sizes().vec(), other.sizes().vec()) == 0,
+                        guard.dc.ctx, cptr<T>(wide), cptr<T>(narrow), mptr<T>(out),
+                        wide.sizes().vec(), narrow.sizes().vec()) == 0,
                     "xdnn::broadcast_add failed");
     }
     return out;
